@@ -1,0 +1,67 @@
+{
+  "project_info": {
+    "project_number": "914391963155",
+    "project_id": "t-ride-ee6ee",
+    "storage_bucket": "t-ride-ee6ee.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:914391963155:android:4be271b1097822311611e6",
+        "android_client_info": {
+          "package_name": "com.example.t_ride_rider_app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAPtnMzsbX9CAnWMk6pL44w1kXHm1cIDJU"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:914391963155:android:334ee3531a7f88f31611e6",
+        "android_client_info": {
+          "package_name": "com.example.t_rider_services_app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAPtnMzsbX9CAnWMk6pL44w1kXHm1cIDJU"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:914391963155:android:463f018c5497db021611e6",
+        "android_client_info": {
+          "package_name": "com.tride.order"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAPtnMzsbX9CAnWMk6pL44w1kXHm1cIDJU"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
