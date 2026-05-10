@@ -26,20 +26,20 @@ class ServiceModeTilesSection extends StatelessWidget {
   static const List<_ServiceModeItem> _items = [
     _ServiceModeItem(
       asset: 'assets/Vector.png',
-      title: 'ride',
-      subtitle: 'book_a_trip',
+      title: 'Ride Trips',
+      subtitle: 'Manage ride requests',
       screen: _ModeScreen.ride,
     ),
     _ServiceModeItem(
       asset: 'assets/Vector (2).png',
-      title: 'courier',
-      subtitle: 'send_parcels',
+      title: 'Courier Trips',
+      subtitle: 'Manage courier requests',
       screen: _ModeScreen.courier,
     ),
     _ServiceModeItem(
       asset: 'assets/Group.png',
-      title: 'delivery',
-      subtitle: 'food_and_more',
+      title: 'Delivery Trips',
+      subtitle: 'Manage delivery requests',
       screen: _ModeScreen.delivery,
     ),
   ];

@@ -47,6 +47,7 @@ class ActiveRideCourierOrder {
     this.rideCustomId,
     this.riderId,
     this.driverId,
+    this.acceptedAt,
     this.receiverName,
     this.receiverPhone,
     this.packageSize,
@@ -71,6 +72,9 @@ class ActiveRideCourierOrder {
   final String? rideCustomId;
   final int? riderId;
   final int? driverId;
+
+  /// When the rider assigned / driver accepted (API or client-parsed).
+  final DateTime? acceptedAt;
   final String? receiverName;
   final String? receiverPhone;
   final String? packageSize;
@@ -102,6 +106,9 @@ class ActiveRideCourierOrder {
       rideCustomId: json['ride_custom_id'] as String?,
       riderId: (json['rider_id'] as num?)?.toInt(),
       driverId: (json['driver_id'] as num?)?.toInt(),
+      acceptedAt: _parseAcceptedAtFlexible(
+        json['accepted_at'] ?? json['acceptedAt'],
+      ),
       receiverName: json['receiver_name'] as String?,
       receiverPhone: json['receiver_phone'] as String?,
       packageSize: json['package_size'] as String?,
@@ -122,6 +129,23 @@ class ActiveRideCourierOrder {
           ? ActiveDriverSummary.fromJson(_asJsonMap(json['driver'])!)
           : null,
     );
+  }
+
+  static DateTime? _parseAcceptedAtFlexible(dynamic v) {
+    if (v == null) return null;
+    if (v is DateTime) return v.toLocal();
+    if (v is String) {
+      final d = DateTime.tryParse(v);
+      return d?.toLocal();
+    }
+    if (v is int) {
+      return DateTime.fromMillisecondsSinceEpoch(v, isUtc: true).toLocal();
+    }
+    if (v is num) {
+      return DateTime.fromMillisecondsSinceEpoch(v.round(), isUtc: true)
+          .toLocal();
+    }
+    return null;
   }
 }
 

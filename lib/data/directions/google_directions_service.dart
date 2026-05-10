@@ -6,14 +6,33 @@ import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:http/http.dart' as http;
 import 'package:t_rider_services_app/config/maps_config.dart';
 
+/// Decoded driving route plus optional leg totals from Google Directions.
+class DrivingRouteSummary {
+  const DrivingRouteSummary({
+    required this.points,
+    required this.durationSeconds,
+    required this.distanceMeters,
+  });
+
+  final List<LatLng> points;
+
+  /// Total driving time (sum of legs), seconds.
+  final int durationSeconds;
+
+  /// Total distance (sum of legs), meters.
+  final int distanceMeters;
+
+  Duration get duration => Duration(seconds: durationSeconds);
+}
+
 /// Fetches a driving route between two points using the Google Directions API.
 class GoogleDirectionsService {
   GoogleDirectionsService._();
 
   static const _timeout = Duration(seconds: 20);
 
-  /// Returns decoded [LatLng] points along roads, or `null` if the request fails.
-  static Future<List<LatLng>?> fetchDrivingPolyline({
+  /// Roads-accurate route with overview polyline and leg totals (sum of legs).
+  static Future<DrivingRouteSummary?> fetchDrivingRoute({
     required LatLng origin,
     required LatLng destination,
   }) async {
@@ -98,7 +117,30 @@ class GoogleDirectionsService {
         return null;
       }
 
-      return _decodeEncodedPolyline(encoded);
+      final pts = _decodeEncodedPolyline(encoded);
+
+      var durationSec = 0;
+      var distanceM = 0;
+      final legs = first['legs'];
+      if (legs is List) {
+        for (final leg in legs) {
+          if (leg is! Map<String, dynamic>) continue;
+          final d = leg['duration'];
+          if (d is Map && d['value'] is num) {
+            durationSec += (d['value'] as num).round();
+          }
+          final dist = leg['distance'];
+          if (dist is Map && dist['value'] is num) {
+            distanceM += (dist['value'] as num).round();
+          }
+        }
+      }
+
+      return DrivingRouteSummary(
+        points: pts,
+        durationSeconds: durationSec <= 0 ? 1 : durationSec,
+        distanceMeters: distanceM <= 0 ? 1 : distanceM,
+      );
     } on TimeoutException catch (e, st) {
       debugPrint('[GoogleDirectionsService] Request timed out: $e\n$st');
       return null;
@@ -108,6 +150,15 @@ class GoogleDirectionsService {
       );
       return null;
     }
+  }
+
+  /// Returns decoded points only (same Roads API pipeline as [fetchDrivingRoute]).
+  static Future<List<LatLng>?> fetchDrivingPolyline({
+    required LatLng origin,
+    required LatLng destination,
+  }) async {
+    final r = await fetchDrivingRoute(origin: origin, destination: destination);
+    return r?.points;
   }
 
   static String _truncate(String s, int max) {

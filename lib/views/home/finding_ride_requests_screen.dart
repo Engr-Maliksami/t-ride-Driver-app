@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:math' as math;
-import 'dart:ui' as ui;
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/foundation.dart';
@@ -10,12 +9,17 @@ import 'package:flutter_screenutil/flutter_screenutil.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:get/get.dart';
+import 'package:intl/intl.dart' show DateFormat;
 import 'package:t_rider_services_app/consts/appConst.dart';
+import 'package:t_rider_services_app/config/home_map_styles.dart';
 import 'package:t_rider_services_app/data/local/secure_storage_service.dart';
 import 'package:t_rider_services_app/data/directions/google_directions_service.dart';
 import 'package:t_rider_services_app/data/models/order_active_status_model.dart';
 import 'package:t_rider_services_app/data/repositories/rides_repository.dart';
+import 'package:t_rider_services_app/utils/driver_location_marker_bitmap.dart';
+import 'package:t_rider_services_app/utils/order_route_markers_bitmap.dart';
 import 'package:t_rider_services_app/views/home/setting/setting_screen.dart';
+import 'package:t_rider_services_app/views/home/widgets/order_trip_timeline.dart';
 import 'package:t_rider_services_app/views/widgets/app_snackbar.dart';
 
 class FindingRideRequestsScreen extends StatefulWidget {
@@ -55,17 +59,24 @@ class _FindingRideRequestsScreenState extends State<FindingRideRequestsScreen> {
   /// Road-following points from Directions API; `null` until loaded or if fetch fails.
   List<LatLng>? _drivingPolylinePoints;
   LatLng? _driverLatLng;
+  double _driverHeadingDeg = 0;
+
+  DrivingRouteSummary? _pickupDropRouteSummary;
+
+  BitmapDescriptor? _pickupRouteIcon;
+  BitmapDescriptor? _dropRouteIcon;
+  BitmapDescriptor? _driverMarkerIcon;
 
   /// True while requesting driving directions (no placeholder straight line yet).
   bool _routeLoading = false;
   bool _driverLocationSyncing = false;
   Timer? _driverLocationTimer;
-  BitmapDescriptor _driverMarkerIcon = BitmapDescriptor.defaultMarkerWithHue(
-    BitmapDescriptor.hueAzure,
-  );
 
   /// After a successful accept API call; switches primary action from Accept → Cancel.
   bool _acceptedThisSession = false;
+
+  /// Shown until [ActiveRideCourierOrder.acceptedAt] or Firestore `accepted_at` is available.
+  DateTime? _acceptedAtFallback;
   ActiveRideCourierOrder? _rideData;
 
   ActiveRideCourierOrder? get _ride => _rideData;
@@ -104,6 +115,10 @@ class _FindingRideRequestsScreenState extends State<FindingRideRequestsScreen> {
     return CameraPosition(target: p ?? d ?? _fallbackMapCenter, zoom: 13);
   }
 
+  String? get _mapStyleJson => AppConst.isDarkMode
+      ? HomeMapStyles.darkUberLike
+      : HomeMapStyles.lightUberLike;
+
   /// When [awaitDirections] is true, markers are set but no polyline until the
   /// API returns (or fails — then a straight fallback is drawn).
   void _populateMapOverlays({bool awaitDirections = false}) {
@@ -117,9 +132,11 @@ class _FindingRideRequestsScreenState extends State<FindingRideRequestsScreen> {
         Marker(
           markerId: const MarkerId('pickup'),
           position: pickup,
-          icon: BitmapDescriptor.defaultMarkerWithHue(
-            BitmapDescriptor.hueGreen,
-          ),
+          icon:
+              _pickupRouteIcon ??
+              BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueYellow),
+          anchor: const Offset(0.5, 0.5),
+          zIndexInt: 2,
           infoWindow: InfoWindow(
             title: 'pickup'.tr,
             snippet: _shortSnippet(r?.pickupAddress),
@@ -132,7 +149,11 @@ class _FindingRideRequestsScreenState extends State<FindingRideRequestsScreen> {
         Marker(
           markerId: const MarkerId('dropoff'),
           position: drop,
-          icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueRed),
+          icon:
+              _dropRouteIcon ??
+              BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueYellow),
+          anchor: const Offset(0.5, 0.5),
+          zIndexInt: 2,
           infoWindow: InfoWindow(
             title: 'destination'.tr,
             snippet: _shortSnippet(r?.dropoffAddress),
@@ -141,13 +162,16 @@ class _FindingRideRequestsScreenState extends State<FindingRideRequestsScreen> {
       );
     }
     final driver = _driverLatLng;
-    if (driver != null) {
+    if (driver != null && _driverMarkerIcon != null) {
       _markers.add(
         Marker(
           markerId: const MarkerId('driver'),
           position: driver,
-          icon: _driverMarkerIcon,
+          icon: _driverMarkerIcon!,
           anchor: const Offset(0.5, 0.5),
+          flat: true,
+          rotation: _driverHeadingDeg,
+          zIndexInt: 3,
           infoWindow: InfoWindow(title: 'driver'.tr),
         ),
       );
@@ -155,71 +179,44 @@ class _FindingRideRequestsScreenState extends State<FindingRideRequestsScreen> {
     if (pickup != null && drop != null && !awaitDirections) {
       _setPrimaryRoutePolylinePoints([pickup, drop], geodesic: true);
     }
-    if (driver != null && pickup != null && !awaitDirections) {
-      final fallbackPoints = <LatLng>[driver, pickup];
-      if (drop != null) fallbackPoints.add(drop);
-      _setDriverToDestinationPolylinePoints(fallbackPoints, geodesic: true);
-    }
   }
 
-  Future<void> _initDriverMarkerIcon() async {
-    final customIcon = await _buildDriverMarkerIcon();
-    if (!mounted || customIcon == null) return;
-    setState(() => _driverMarkerIcon = customIcon);
-    _refreshDriverMarker();
-  }
-
-  Future<BitmapDescriptor?> _buildDriverMarkerIcon() async {
-    const double canvasSize = 80;
-    const double circleRadius = 28;
-    const double iconSize = 34;
-    const Color backgroundColor = Colors.blueAccent;
-
-    final recorder = ui.PictureRecorder();
-    final canvas = Canvas(recorder);
-    final center = const Offset(canvasSize / 2, canvasSize / 2);
-
-    final circlePaint = Paint()..color = backgroundColor;
-    canvas.drawCircle(center, circleRadius, circlePaint);
-
-    final iconPainter = TextPainter(textDirection: TextDirection.ltr);
-    iconPainter.text = TextSpan(
-      text: String.fromCharCode(Icons.directions_car.codePoint),
-      style: TextStyle(
-        fontSize: iconSize,
-        fontFamily: Icons.directions_car.fontFamily,
-        package: Icons.directions_car.fontPackage,
-        color: Colors.black,
-      ),
-    );
-    iconPainter.layout();
-    final iconOffset = Offset(
-      center.dx - (iconPainter.width / 2),
-      center.dy - (iconPainter.height / 2),
-    );
-    iconPainter.paint(canvas, iconOffset);
-
-    final image = await recorder.endRecording().toImage(
-      canvasSize.toInt(),
-      canvasSize.toInt(),
-    );
-    final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
-    final bytes = byteData?.buffer.asUint8List();
-    if (bytes == null) return null;
-    return BitmapDescriptor.bytes(bytes);
+  Future<void> _loadUberStyleMarkerBitmaps() async {
+    try {
+      final p = await pickupRouteMarkerBitmap();
+      final d = await destinationRouteMarkerBitmap();
+      final drv = await buildDriverLocationMarkerBitmap(
+        darkVariant: AppConst.isDarkMode,
+      );
+      if (!mounted) return;
+      setState(() {
+        _pickupRouteIcon = p;
+        _dropRouteIcon = d;
+        _driverMarkerIcon = drv;
+      });
+      _populateMapOverlays(
+        awaitDirections:
+            _routeLoading && _pickupLatLng != null && _dropLatLng != null,
+      );
+      _refreshDriverMarker();
+    } catch (_) {}
   }
 
   void _refreshDriverMarker() {
     final driver = _driverLatLng;
+    final icon = _driverMarkerIcon;
     setState(() {
       _markers.removeWhere((m) => m.markerId.value == 'driver');
-      if (driver != null) {
+      if (driver != null && icon != null) {
         _markers.add(
           Marker(
             markerId: const MarkerId('driver'),
             position: driver,
-            icon: _driverMarkerIcon,
+            icon: icon,
             anchor: const Offset(0.5, 0.5),
+            flat: true,
+            rotation: _driverHeadingDeg,
+            zIndexInt: 3,
             infoWindow: InfoWindow(title: 'driver'.tr),
           ),
         );
@@ -236,27 +233,10 @@ class _FindingRideRequestsScreenState extends State<FindingRideRequestsScreen> {
       Polyline(
         polylineId: const PolylineId('route'),
         points: points,
-        color: AppConst.black,
-        width: 5,
+        color: kOrderRoutePurple,
+        width: 8,
         geodesic: geodesic,
-        startCap: Cap.roundCap,
-        endCap: Cap.roundCap,
-      ),
-    );
-  }
-
-  void _setDriverToDestinationPolylinePoints(
-    List<LatLng> points, {
-    required bool geodesic,
-  }) {
-    _polylines.removeWhere((p) => p.polylineId.value == 'driver_to_drop');
-    _polylines.add(
-      Polyline(
-        polylineId: const PolylineId('driver_to_drop'),
-        points: points,
-        color: Colors.blueAccent,
-        width: 5,
-        geodesic: geodesic,
+        jointType: JointType.round,
         startCap: Cap.roundCap,
         endCap: Cap.roundCap,
       ),
@@ -271,77 +251,30 @@ class _FindingRideRequestsScreenState extends State<FindingRideRequestsScreen> {
       return;
     }
 
-    final pts = await GoogleDirectionsService.fetchDrivingPolyline(
+    final summary = await GoogleDirectionsService.fetchDrivingRoute(
       origin: pickup,
       destination: drop,
     );
 
     if (!mounted) return;
 
-    if (pts != null && pts.length >= 2) {
+    if (summary != null && summary.points.length >= 2) {
       setState(() {
         _routeLoading = false;
-        _drivingPolylinePoints = pts;
-        _setPrimaryRoutePolylinePoints(pts, geodesic: false);
+        _drivingPolylinePoints = summary.points;
+        _pickupDropRouteSummary = summary;
+        _setPrimaryRoutePolylinePoints(summary.points, geodesic: false);
       });
       await _fitCameraToRoute();
     } else {
       setState(() {
         _routeLoading = false;
         _drivingPolylinePoints = null;
+        _pickupDropRouteSummary = null;
         _setPrimaryRoutePolylinePoints([pickup, drop], geodesic: true);
       });
       await _fitCameraToRoute();
     }
-  }
-
-  Future<void> _loadDriverToDestinationRoute() async {
-    final driver = _driverLatLng;
-    final pickup = _pickupLatLng;
-    final drop = _dropLatLng;
-    if (driver == null || pickup == null) {
-      if (mounted) {
-        setState(() {
-          _polylines.removeWhere((p) => p.polylineId.value == 'driver_to_drop');
-        });
-      }
-      return;
-    }
-
-    // Segment 1: driver -> pickup
-    final driverToPickup = await GoogleDirectionsService.fetchDrivingPolyline(
-      origin: driver,
-      destination: pickup,
-    );
-
-    // Segment 2: pickup -> destination (optional when destination exists)
-    List<LatLng>? pickupToDrop;
-    if (drop != null) {
-      pickupToDrop = await GoogleDirectionsService.fetchDrivingPolyline(
-        origin: pickup,
-        destination: drop,
-      );
-    }
-
-    if (!mounted) return;
-    setState(() {
-      final fallbackPoints = <LatLng>[driver, pickup];
-      if (drop != null) fallbackPoints.add(drop);
-
-      if (driverToPickup == null || driverToPickup.length < 2) {
-        _setDriverToDestinationPolylinePoints(fallbackPoints, geodesic: true);
-        return;
-      }
-
-      final merged = <LatLng>[...driverToPickup];
-      if (pickupToDrop != null && pickupToDrop.length >= 2) {
-        // Avoid duplicating pickup point if segment2 starts where segment1 ends.
-        merged.addAll(pickupToDrop.skip(1));
-      } else if (drop != null) {
-        merged.add(drop);
-      }
-      _setDriverToDestinationPolylinePoints(merged, geodesic: false);
-    });
   }
 
   Future<void> _refreshDriverLocationAndRoute({
@@ -366,6 +299,10 @@ class _FindingRideRequestsScreenState extends State<FindingRideRequestsScreen> {
         ),
       );
       final nextDriver = LatLng(position.latitude, position.longitude);
+      final h = position.heading;
+      if (h >= 0 && h <= 360) {
+        _driverHeadingDeg = h.toDouble();
+      }
       if (mounted) {
         _driverLatLng = nextDriver;
         _refreshDriverMarker();
@@ -454,7 +391,6 @@ class _FindingRideRequestsScreenState extends State<FindingRideRequestsScreen> {
         _driverLatLng = LatLng(lat, lng);
         _populateMapOverlays(awaitDirections: true);
       });
-      await _loadDriverToDestinationRoute();
     } catch (e) {
       debugPrint('[FindingRideRequestsScreen][driver_location_read] error: $e');
     }
@@ -521,34 +457,97 @@ class _FindingRideRequestsScreenState extends State<FindingRideRequestsScreen> {
     await c.animateCamera(CameraUpdate.newLatLngBounds(bounds, 72));
   }
 
-  String get _passengerLine {
-    final r = _ride;
-    if (r?.rideCustomId != null && r!.rideCustomId!.isNotEmpty) {
-      return '${'request'.tr} ${r.rideCustomId}';
+  String get _pickupAddressPlain {
+    final a = _ride?.pickupAddress?.trim();
+    if (a != null && a.isNotEmpty) return a;
+    return '—';
+  }
+
+  String get _dropAddressPlain {
+    final a = _ride?.dropoffAddress?.trim();
+    if (a != null && a.isNotEmpty) return a;
+    return '—';
+  }
+
+  String get _scheduleDisplayLine {
+    final accepted = _acceptedThisSession || (_ride?.driverId != null);
+    if (!accepted) {
+      return 'map_order_schedule_unknown'.tr;
     }
-    return '${'passenger'.tr}: John Doe';
-  }
-
-  String get _pickupLine {
-    final a = _ride?.pickupAddress;
-    if (a != null && a.isNotEmpty) return '${'pickup'.tr}: $a';
-    return '${'pickup_location'.tr}: ~Plot 504';
-  }
-
-  String get _dropLine {
-    final a = _ride?.dropoffAddress;
-    if (a != null && a.isNotEmpty) return '${'drop'.tr}: $a';
-    return '${'drop_location'.tr}: ~Street 2';
-  }
-
-  String get _fareLine {
-    final f = _ride?.fare;
-    if (f != null && f.isNotEmpty) {
-      final p = _ride?.paymentMethod;
-      if (p != null && p.isNotEmpty) return '${'fare'.tr}: $f • $p';
-      return '${'fare'.tr}: $f';
+    final at = _ride?.acceptedAt ?? _acceptedAtFallback;
+    if (at != null) {
+      final localeTag = Get.locale?.toLanguageTag() ?? 'en_US';
+      final fmt = DateFormat('EEE, MMM d · h:mm a', localeTag).format(at);
+      return 'order_accepted_at_line'.tr.replaceAll('@time', fmt);
     }
-    return '${'distance_to_pickup'.tr}: ~24mins';
+    return 'order_accepted_time_pending'.tr;
+  }
+
+  Future<void> _refreshAcceptedAtFromFirestore() async {
+    try {
+      final ref = await _getFirestoreOrderRef();
+      if (ref == null || !mounted) return;
+      final snap = await ref.get();
+      final data = snap.data();
+      if (data == null || !mounted) return;
+      final v = data['accepted_at'];
+      DateTime? dt;
+      if (v is Timestamp) {
+        dt = v.toDate().toLocal();
+      } else if (v is String) {
+        dt = DateTime.tryParse(v)?.toLocal();
+      } else if (v is int) {
+        dt = DateTime.fromMillisecondsSinceEpoch(v, isUtc: true).toLocal();
+      } else if (v is num) {
+        dt = DateTime.fromMillisecondsSinceEpoch(
+          v.round(),
+          isUtc: true,
+        ).toLocal();
+      }
+      if (dt != null && mounted) {
+        setState(() => _acceptedAtFallback = dt);
+      }
+    } catch (e) {
+      debugPrint('[FindingRideRequestsScreen][accepted_at] error: $e');
+    }
+  }
+
+  String _formatDurationForTripStats(Duration d) {
+    if (d.inHours >= 1) {
+      final m = d.inMinutes.remainder(60);
+      if (m <= 0) return '${d.inHours} hr';
+      return '${d.inHours} hr $m min';
+    }
+    if (d.inMinutes < 1) return '${d.inSeconds}s';
+    return '${d.inMinutes} min';
+  }
+
+  String get _tripStatsDisplayLine {
+    final s = _pickupDropRouteSummary;
+    if (s == null) return 'map_order_route_fallback'.tr;
+    final durStr = _formatDurationForTripStats(s.duration);
+    final mi = s.distanceMeters / 1609.344;
+    return '$durStr · ${mi.toStringAsFixed(1)} mi';
+  }
+
+  String get _formattedFareLarge {
+    final f = _ride?.fare?.trim();
+    if (f == null || f.isEmpty) return '—';
+    if (f.startsWith(r'$')) return f;
+    final n = double.tryParse(f.replaceAll(',', ''));
+    if (n != null) return '\$${n.toStringAsFixed(2)}';
+    return '\$$f';
+  }
+
+  String get _riderDisplayLabel {
+    final n = _ride?.receiverName?.trim();
+    if (n != null && n.isNotEmpty) {
+      final parts = n.split(RegExp(r'\s+'));
+      return parts.first;
+    }
+    final id = _ride?.rideCustomId?.trim();
+    if (id != null && id.isNotEmpty) return '${'request'.tr} $id';
+    return 'passenger'.tr;
   }
 
   /// For rides fetched from `GET /api/app/rides/{id}`:
@@ -611,8 +610,12 @@ class _FindingRideRequestsScreenState extends State<FindingRideRequestsScreen> {
         );
       }
       if (dataMap != null && mounted) {
+        final merged = ActiveRideCourierOrder.fromJson(dataMap);
         setState(() {
-          _rideData = ActiveRideCourierOrder.fromJson(dataMap);
+          _rideData = merged;
+          if (merged.acceptedAt != null) {
+            _acceptedAtFallback = null;
+          }
           _detailsLoading = false;
         });
         _syncViewingOrderMarker();
@@ -902,8 +905,10 @@ class _FindingRideRequestsScreenState extends State<FindingRideRequestsScreen> {
       setState(() {
         _rideActionInProgress = false;
         _acceptedThisSession = true;
+        _acceptedAtFallback = DateTime.now();
       });
       await _markAcceptedInFirestore();
+      await _refreshAcceptedAtFromFirestore();
       await _ensureDriverLiveLocationTracking();
       await _fetchOrderDetailsIfNeeded();
       AppSnackbar.showSuccess(
@@ -966,11 +971,14 @@ class _FindingRideRequestsScreenState extends State<FindingRideRequestsScreen> {
     final awaitsRoute = _pickupLatLng != null && _dropLatLng != null;
     _routeLoading = awaitsRoute;
     _populateMapOverlays(awaitDirections: awaitsRoute);
-    _initDriverMarkerIcon();
+    unawaited(_loadUberStyleMarkerBitmaps());
     _loadDrivingRoute();
     _loadDriverLocationFromFirestoreIfAny();
     _fetchOrderDetailsIfNeeded();
     _ensureDriverLiveLocationTracking();
+    if (_ride?.driverId != null && _ride?.acceptedAt == null) {
+      unawaited(_refreshAcceptedAtFromFirestore());
+    }
   }
 
   @override
@@ -1049,9 +1057,10 @@ class _FindingRideRequestsScreenState extends State<FindingRideRequestsScreen> {
                     children: [
                       GoogleMap(
                         initialCameraPosition: _initialCamera,
+                        style: _mapStyleJson,
                         markers: _markers,
                         polylines: _polylines,
-                        myLocationEnabled: true,
+                        myLocationEnabled: false,
                         myLocationButtonEnabled: false,
                         zoomControlsEnabled: false,
                         mapToolbarEnabled: false,
@@ -1196,232 +1205,214 @@ class _FindingRideRequestsScreenState extends State<FindingRideRequestsScreen> {
             minChildSize: 0.25,
             maxChildSize: 0.9,
             builder: (context, scrollController) {
-              return Container(
-                decoration: BoxDecoration(
-                  color: AppConst.primaryColor,
-                  borderRadius: BorderRadius.only(
-                    topLeft: Radius.circular(20.r),
-                    topRight: Radius.circular(20.r),
-                  ),
-                ),
+              return Material(
+                color: Colors.white,
+                elevation: 16,
+                shadowColor: Colors.black.withValues(alpha: 0.16),
+                borderRadius: BorderRadius.vertical(top: Radius.circular(20.r)),
+                clipBehavior: Clip.antiAlias,
                 child: Column(
                   children: [
-                    // Drag Handle
                     Container(
-                      margin: EdgeInsets.only(top: 12.h),
-                      width: 40.w,
+                      margin: EdgeInsets.only(top: 10.h),
+                      width: 42.w,
                       height: 4.h,
                       decoration: BoxDecoration(
-                        color: AppConst.white,
-                        borderRadius: BorderRadius.circular(2.r),
+                        color: Colors.black.withValues(alpha: 0.08),
+                        borderRadius: BorderRadius.circular(999),
                       ),
                     ),
-                    // Scrollable Content
                     Expanded(
                       child: SingleChildScrollView(
                         controller: scrollController,
-                        padding: EdgeInsets.symmetric(
-                          horizontal: 20.w,
-                          vertical: 20.h,
-                        ),
+                        physics: const ClampingScrollPhysics(),
+                        padding: EdgeInsets.fromLTRB(22.w, 16.h, 22.w, 20.h),
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
-                            // Ride Request Details Card
-                            Container(
-                              padding: EdgeInsets.all(20.w),
-                              decoration: BoxDecoration(
-                                color: AppConst.white,
-                                borderRadius: AppConst.borderRadius,
-                                boxShadow: [
-                                  BoxShadow(
-                                    color: AppConst.blackWithOpacity(0.1),
-                                    blurRadius: 4,
-                                    offset: const Offset(0, 2),
-                                  ),
-                                ],
-                              ),
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  // Request / passenger line
-                                  Text(
-                                    _passengerLine,
+                            Row(
+                              crossAxisAlignment: CrossAxisAlignment.end,
+                              children: [
+                                Expanded(
+                                  child: Text(
+                                    _formattedFareLarge,
                                     style: TextStyle(
-                                      color: AppConst.black,
-                                      fontSize: 16.sp,
-                                      fontWeight: FontWeight.bold,
+                                      color: Colors.black,
+                                      fontSize: 31.sp,
+                                      fontWeight: FontWeight.w800,
+                                      letterSpacing: -0.9,
+                                      height: 1.05,
                                     ),
                                   ),
-                                  SizedBox(height: 12.h),
-                                  // Pickup Location
-                                  Row(
-                                    children: [
-                                      Icon(
-                                        Icons.location_on,
-                                        color: AppConst.black,
-                                        size: 20.sp,
-                                      ),
-                                      SizedBox(width: 8.w),
-                                      Expanded(
-                                        child: Text(
-                                          _pickupLine,
-                                          style: TextStyle(
-                                            color: AppConst.black,
-                                            fontSize: 14.sp,
-                                          ),
+                                ),
+                                if (_ride?.paymentMethod != null &&
+                                    _ride!.paymentMethod!.trim().isNotEmpty)
+                                  Padding(
+                                    padding: EdgeInsets.only(bottom: 4.h),
+                                    child: Text(
+                                      _ride!.paymentMethod!.trim(),
+                                      style: TextStyle(
+                                        color: Colors.black.withValues(
+                                          alpha: 0.55,
                                         ),
+                                        fontSize: 13.sp,
+                                        fontWeight: FontWeight.w600,
                                       ),
-                                    ],
-                                  ),
-                                  SizedBox(height: 8.h),
-                                  // Drop Location
-                                  Row(
-                                    children: [
-                                      Icon(
-                                        Icons.location_on,
-                                        color: AppConst.black,
-                                        size: 20.sp,
-                                      ),
-                                      SizedBox(width: 8.w),
-                                      Expanded(
-                                        child: Text(
-                                          _dropLine,
-                                          style: TextStyle(
-                                            color: AppConst.black,
-                                            fontSize: 14.sp,
-                                          ),
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                                  SizedBox(height: 8.h),
-                                  // Fare / ETA placeholder
-                                  Row(
-                                    children: [
-                                      Icon(
-                                        _ride != null
-                                            ? Icons.payments_outlined
-                                            : Icons.access_time,
-                                        color: AppConst.black,
-                                        size: 20.sp,
-                                      ),
-                                      SizedBox(width: 8.w),
-                                      Expanded(
-                                        child: Text(
-                                          _fareLine,
-                                          style: TextStyle(
-                                            color: AppConst.black,
-                                            fontSize: 14.sp,
-                                          ),
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                                  if (_ride != null) ...[
-                                    SizedBox(height: 12.h),
-                                    Builder(
-                                      builder: (context) {
-                                        final ride = _ride!;
-                                        return Column(
-                                          crossAxisAlignment:
-                                              CrossAxisAlignment.start,
-                                          children: [
-                                            Wrap(
-                                              spacing: 8.w,
-                                              runSpacing: 6.h,
-                                              children: [
-                                                // if ((ride.status ?? '')
-                                                //     .isNotEmpty)
-                                                //   _detailChip(
-                                                //     Icons.flag_outlined,
-                                                //     'Status ${ride.status}',
-                                                //   ),
-                                                if ((ride.paymentStatus ?? '')
-                                                    .isNotEmpty)
-                                                  _detailChip(
-                                                    Icons.receipt_long_outlined,
-                                                    '${'payment'.tr} ${ride.paymentStatus}',
-                                                  ),
-                                              ],
-                                            ),
-                                            if ((ride.pickupInstructions ?? '')
-                                                    .isNotEmpty ||
-                                                (ride.dropoffInstructions ?? '')
-                                                    .isNotEmpty) ...[
-                                              SizedBox(height: 10.h),
-                                              if ((ride.pickupInstructions ??
-                                                      '')
-                                                  .isNotEmpty)
-                                                Text(
-                                                  '${'pickup_note'.tr}: ${ride.pickupInstructions}',
-                                                  style: TextStyle(
-                                                    color:
-                                                        AppConst.blackWithOpacity(
-                                                          0.7,
-                                                        ),
-                                                    fontSize: 12.sp,
-                                                  ),
-                                                ),
-                                              if ((ride.dropoffInstructions ??
-                                                      '')
-                                                  .isNotEmpty) ...[
-                                                SizedBox(height: 4.h),
-                                                Text(
-                                                  '${'dropoff_note'.tr}: ${ride.dropoffInstructions}',
-                                                  style: TextStyle(
-                                                    color:
-                                                        AppConst.blackWithOpacity(
-                                                          0.7,
-                                                        ),
-                                                    fontSize: 12.sp,
-                                                  ),
-                                                ),
-                                              ],
-                                            ],
-                                          ],
-                                        );
-                                      },
                                     ),
-                                  ],
-                                ],
+                                  ),
+                              ],
+                            ),
+                            Divider(
+                              height: 28.h,
+                              thickness: 1,
+                              color: Colors.black.withValues(alpha: 0.07),
+                            ),
+                            OrderTripTimelineRows(
+                              pickupTimeLine: _scheduleDisplayLine,
+                              pickupAddress: _pickupAddressPlain,
+                              tripStatsLine: _tripStatsDisplayLine,
+                              destinationTitle: _dropAddressPlain.isEmpty
+                                  ? 'map_order_destination_fallback'.tr
+                                  : _dropAddressPlain,
+                            ),
+                            Divider(
+                              height: 28.h,
+                              thickness: 1,
+                              color: Colors.black.withValues(alpha: 0.07),
+                            ),
+                            Text(
+                              _riderDisplayLabel,
+                              style: TextStyle(
+                                color: Colors.black,
+                                fontSize: 17.sp,
+                                fontWeight: FontWeight.w700,
                               ),
                             ),
-                            SizedBox(height: 20.h),
-                            if (_showAcceptButton)
-                              SizedBox(
-                                width: double.infinity,
-                                height: 50.h,
-                                child: ElevatedButton(
-                                  onPressed: _rideActionInProgress
-                                      ? null
-                                      : _onAcceptRide,
-                                  style: ElevatedButton.styleFrom(
-                                    backgroundColor: AppConst.black,
-                                    disabledBackgroundColor:
-                                        AppConst.blackWithOpacity(0.4),
-                                    shape: RoundedRectangleBorder(
-                                      borderRadius: BorderRadius.circular(12.r),
-                                    ),
-                                  ),
-                                  child: _rideActionInProgress
-                                      ? SizedBox(
-                                          width: 22.w,
-                                          height: 22.w,
-                                          child: CircularProgressIndicator(
-                                            strokeWidth: 2,
-                                            color: AppConst.white,
+                            SizedBox(height: 8.h),
+                            // Row(
+                            //   children: [
+                            //     Icon(
+                            //       Icons.star_rounded,
+                            //       color: Colors.black87,
+                            //       size: 19.sp,
+                            //     ),
+                            //     SizedBox(width: 4.w),
+                            //     Text(
+                            //       'map_order_rating_unknown'.tr,
+                            //       style: TextStyle(
+                            //         color: Colors.black87,
+                            //         fontSize: 15.sp,
+                            //         fontWeight: FontWeight.w600,
+                            //       ),
+                            //     ),
+                            //   ],
+                            // ),
+                            if (_ride != null) ...[
+                              Builder(
+                                builder: (context) {
+                                  final ride = _ride!;
+                                  return Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      if ((ride.paymentStatus ?? '')
+                                          .isNotEmpty) ...[
+                                        SizedBox(height: 14.h),
+                                        Wrap(
+                                          spacing: 8.w,
+                                          runSpacing: 6.h,
+                                          children: [
+                                            _detailChip(
+                                              Icons.receipt_long_outlined,
+                                              '${'payment'.tr} ${ride.paymentStatus}',
+                                            ),
+                                          ],
+                                        ),
+                                      ],
+                                      if ((ride.pickupInstructions ?? '')
+                                              .isNotEmpty ||
+                                          (ride.dropoffInstructions ?? '')
+                                              .isNotEmpty) ...[
+                                        SizedBox(height: 12.h),
+                                        if ((ride.pickupInstructions ?? '')
+                                            .isNotEmpty)
+                                          Text(
+                                            '${'pickup_note'.tr}: ${ride.pickupInstructions}',
+                                            style: TextStyle(
+                                              color: AppConst.blackWithOpacity(
+                                                0.7,
+                                              ),
+                                              fontSize: 12.sp,
+                                            ),
                                           ),
-                                        )
-                                      : Text(
-                                          'accept'.tr,
-                                          style: TextStyle(
-                                            color: AppConst.white,
-                                            fontSize: 16.sp,
-                                            fontWeight: FontWeight.w600,
+                                        if ((ride.dropoffInstructions ?? '')
+                                            .isNotEmpty) ...[
+                                          SizedBox(height: 4.h),
+                                          Text(
+                                            '${'dropoff_note'.tr}: ${ride.dropoffInstructions}',
+                                            style: TextStyle(
+                                              color: AppConst.blackWithOpacity(
+                                                0.7,
+                                              ),
+                                              fontSize: 12.sp,
+                                            ),
+                                          ),
+                                        ],
+                                      ],
+                                    ],
+                                  );
+                                },
+                              ),
+                            ],
+                            SizedBox(height: 22.h),
+                            if (_showAcceptButton)
+                              Row(
+                                children: [
+                                  Expanded(
+                                    child: OutlinedButton(
+                                      style: OutlinedButton.styleFrom(
+                                        padding: EdgeInsets.symmetric(
+                                          vertical: 14.h,
+                                        ),
+                                        side: BorderSide(
+                                          color: Colors.black.withValues(
+                                            alpha: 0.12,
                                           ),
                                         ),
-                                ),
+                                        foregroundColor: Colors.black87,
+                                      ),
+                                      onPressed: _rideActionInProgress
+                                          ? null
+                                          : () => Get.back<void>(),
+                                      child: Text('cancel'.tr),
+                                    ),
+                                  ),
+                                  SizedBox(width: 12.w),
+                                  Expanded(
+                                    child: FilledButton(
+                                      style: FilledButton.styleFrom(
+                                        padding: EdgeInsets.symmetric(
+                                          vertical: 14.h,
+                                        ),
+                                        backgroundColor: kOrderRoutePurple,
+                                        foregroundColor: Colors.white,
+                                      ),
+                                      onPressed: _rideActionInProgress
+                                          ? null
+                                          : _onAcceptRide,
+                                      child: _rideActionInProgress
+                                          ? SizedBox(
+                                              width: 22.w,
+                                              height: 22.w,
+                                              child: CircularProgressIndicator(
+                                                strokeWidth: 2,
+                                                color: Colors.white,
+                                              ),
+                                            )
+                                          : Text('accept'.tr),
+                                    ),
+                                  ),
+                                ],
                               )
                             else if (_showMarkCompleteButton)
                               Column(
@@ -1430,14 +1421,17 @@ class _FindingRideRequestsScreenState extends State<FindingRideRequestsScreen> {
                                   SizedBox(
                                     width: double.infinity,
                                     height: 50.h,
-                                    child: ElevatedButton(
+                                    child: FilledButton(
                                       onPressed: _rideActionInProgress
                                           ? null
                                           : _onMarkCompletePressed,
-                                      style: ElevatedButton.styleFrom(
-                                        backgroundColor: AppConst.black,
+                                      style: FilledButton.styleFrom(
+                                        backgroundColor: kOrderRoutePurple,
+                                        foregroundColor: Colors.white,
                                         disabledBackgroundColor:
-                                            AppConst.blackWithOpacity(0.4),
+                                            kOrderRoutePurple.withValues(
+                                              alpha: 0.45,
+                                            ),
                                         shape: RoundedRectangleBorder(
                                           borderRadius: BorderRadius.circular(
                                             12.r,
@@ -1450,13 +1444,13 @@ class _FindingRideRequestsScreenState extends State<FindingRideRequestsScreen> {
                                               height: 22.w,
                                               child: CircularProgressIndicator(
                                                 strokeWidth: 2,
-                                                color: AppConst.white,
+                                                color: Colors.white,
                                               ),
                                             )
                                           : Text(
                                               'mark_as_completed'.tr,
                                               style: TextStyle(
-                                                color: AppConst.white,
+                                                color: Colors.white,
                                                 fontSize: 16.sp,
                                                 fontWeight: FontWeight.w600,
                                               ),
@@ -1499,24 +1493,24 @@ class _FindingRideRequestsScreenState extends State<FindingRideRequestsScreen> {
                                   SizedBox(
                                     width: double.infinity,
                                     height: 50.h,
-                                    child: ElevatedButton(
+                                    child: OutlinedButton(
                                       onPressed: _rideActionInProgress
                                           ? null
                                           : _onCancelRide,
-                                      style: ElevatedButton.styleFrom(
-                                        backgroundColor: AppConst.grey,
-                                        disabledBackgroundColor: AppConst.grey
-                                            .withValues(alpha: 0.5),
-                                        shape: RoundedRectangleBorder(
-                                          borderRadius: BorderRadius.circular(
-                                            12.r,
+                                      style: OutlinedButton.styleFrom(
+                                        padding: EdgeInsets.symmetric(
+                                          vertical: 14.h,
+                                        ),
+                                        side: BorderSide(
+                                          color: Colors.black.withValues(
+                                            alpha: 0.12,
                                           ),
                                         ),
+                                        foregroundColor: Colors.black87,
                                       ),
                                       child: Text(
                                         'cancel'.tr,
                                         style: TextStyle(
-                                          color: AppConst.white,
                                           fontSize: 16.sp,
                                           fontWeight: FontWeight.w600,
                                         ),
@@ -1529,17 +1523,20 @@ class _FindingRideRequestsScreenState extends State<FindingRideRequestsScreen> {
                               SizedBox(
                                 width: double.infinity,
                                 height: 50.h,
-                                child: ElevatedButton(
+                                child: OutlinedButton(
                                   onPressed: _rideActionInProgress
                                       ? null
                                       : _onCancelRide,
-                                  style: ElevatedButton.styleFrom(
-                                    backgroundColor: AppConst.grey,
-                                    disabledBackgroundColor: AppConst.grey
-                                        .withValues(alpha: 0.5),
-                                    shape: RoundedRectangleBorder(
-                                      borderRadius: BorderRadius.circular(12.r),
+                                  style: OutlinedButton.styleFrom(
+                                    padding: EdgeInsets.symmetric(
+                                      vertical: 14.h,
                                     ),
+                                    side: BorderSide(
+                                      color: Colors.black.withValues(
+                                        alpha: 0.12,
+                                      ),
+                                    ),
+                                    foregroundColor: Colors.black87,
                                   ),
                                   child: _rideActionInProgress
                                       ? SizedBox(
@@ -1547,13 +1544,12 @@ class _FindingRideRequestsScreenState extends State<FindingRideRequestsScreen> {
                                           height: 22.w,
                                           child: CircularProgressIndicator(
                                             strokeWidth: 2,
-                                            color: AppConst.white,
+                                            color: AppConst.black,
                                           ),
                                         )
                                       : Text(
                                           'cancel'.tr,
                                           style: TextStyle(
-                                            color: AppConst.white,
                                             fontSize: 16.sp,
                                             fontWeight: FontWeight.w600,
                                           ),

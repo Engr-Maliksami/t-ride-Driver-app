@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:developer' show log;
 
 import 'package:flutter/foundation.dart';
@@ -9,8 +10,11 @@ import 'package:geolocator/geolocator.dart';
 import 'package:get/get.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:t_rider_services_app/controllers/app_language_controller.dart';
+import 'package:t_rider_services_app/controllers/app_theme_controller.dart';
+import 'package:t_rider_services_app/controllers/driver_map_location_controller.dart';
 import 'package:t_rider_services_app/consts/appConst.dart';
 import 'package:t_rider_services_app/config/api_urls.dart';
+import 'package:t_rider_services_app/config/home_map_styles.dart';
 import 'package:t_rider_services_app/data/local/secure_storage_service.dart';
 import 'package:t_rider_services_app/data/repositories/rider_status_repository.dart';
 import 'package:t_rider_services_app/data/repositories/profile_repository.dart';
@@ -19,6 +23,8 @@ import 'package:t_rider_services_app/views/home/nearby_firestore_orders_screen.d
 import 'package:t_rider_services_app/views/home/widgets/active_orders_section.dart';
 import 'package:t_rider_services_app/views/widgets/app_snackbar.dart';
 import 'package:t_rider_services_app/views/home/widgets/service_mode_tiles_section.dart';
+import 'package:t_rider_services_app/views/home/full_screen_dashboard_map_screen.dart';
+import 'package:t_rider_services_app/utils/driver_location_marker_bitmap.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -42,6 +48,7 @@ class HomeScreenState extends State<HomeScreen> {
   num? _earningsWeekly;
   num? _earningsMonthly;
   String? _userName;
+  int? _userId;
   String? _userPhotoUrl;
   String _carModel = '';
   String _carPlate = '';
@@ -50,7 +57,21 @@ class HomeScreenState extends State<HomeScreen> {
   String _locationLabel = '';
   bool _locationLoading = true;
   LatLng? _userLatLng;
+  double _userHeading = 0;
   GoogleMapController? _mapController;
+  MapType _homeMapType = MapType.normal;
+  BitmapDescriptor? _driverLocationIcon;
+  Worker? _homeMapThemeWorker;
+  Worker? _driverLatLngWorker;
+  Worker? _driverHeadingWorker;
+  Worker? _driverPermissionWorker;
+
+  LatLng? _lastGeocodeAnchor;
+  DateTime _lastGeocodeAt = DateTime.fromMillisecondsSinceEpoch(0);
+
+  /// Last target we centered the home preview map on (avoids jitter; recenters on large moves).
+  LatLng? _lastHomeMapCameraLatLng;
+
   bool get _isDarkMode => AppConst.isDarkMode;
   Color get _cardBackground =>
       _isDarkMode ? const Color(0xFFEFEFEF) : AppConst.white;
@@ -64,13 +85,95 @@ class HomeScreenState extends State<HomeScreen> {
 
   static const LatLng _defaultMapCenter = LatLng(6.5244, 3.3792);
 
+  /// Custom JSON style for normal / terrain map types only (no overlay on imagery).
+  String? get _homeMapStyleJson {
+    final styled =
+        _homeMapType != MapType.satellite && _homeMapType != MapType.hybrid;
+    if (!styled) return null;
+    return AppConst.isDarkMode
+        ? HomeMapStyles.darkUberLike
+        : HomeMapStyles.lightUberLike;
+  }
+
   @override
   void initState() {
     super.initState();
     _loadDriverDashboard();
     _loadProfileHeader();
     _loadLocalCarInfo();
-    _fetchUserLocation();
+    _bindDriverLocationStream();
+    if (Get.isRegistered<AppThemeController>()) {
+      _homeMapThemeWorker = ever(
+        Get.find<AppThemeController>().themeMode,
+        (_) => _onHomeMapThemeChanged(),
+      );
+    }
+  }
+
+  void _onHomeMapThemeChanged() {
+    if (mounted) setState(() {});
+    unawaited(_refreshDriverLocationIcon());
+  }
+
+  Future<void> _refreshDriverLocationIcon() async {
+    try {
+      _driverLocationIcon = await buildDriverLocationMarkerBitmap(
+        darkVariant: AppConst.isDarkMode,
+      );
+      if (mounted) setState(() {});
+    } catch (_) {}
+  }
+
+  void _setHomeMapType(MapType type) {
+    setState(() => _homeMapType = type);
+  }
+
+  /// Centers the dashboard preview map on [_userLatLng] when the controller is ready.
+  Future<void> _syncHomeMapCameraToUser() async {
+    final c = _mapController;
+    final u = _userLatLng;
+    if (c == null || u == null) return;
+
+    final last = _lastHomeMapCameraLatLng;
+    if (last != null) {
+      final d = Geolocator.distanceBetween(
+        last.latitude,
+        last.longitude,
+        u.latitude,
+        u.longitude,
+      );
+      if (d < 100) return;
+    }
+
+    try {
+      await c.animateCamera(CameraUpdate.newLatLngZoom(u, 14));
+      if (!mounted) return;
+      _lastHomeMapCameraLatLng = u;
+    } catch (_) {}
+  }
+
+  Future<void> _onHomeMapCreated(GoogleMapController c) async {
+    _mapController = c;
+    await _refreshDriverLocationIcon();
+    if (!mounted) return;
+    setState(() {});
+    unawaited(_syncHomeMapCameraToUser());
+  }
+
+  Set<Marker> _allHomeMapMarkers() {
+    if (_userLatLng != null && _driverLocationIcon != null) {
+      return {
+        Marker(
+          markerId: const MarkerId('driver_location'),
+          position: _userLatLng!,
+          icon: _driverLocationIcon!,
+          anchor: const Offset(0.5, 0.5),
+          flat: true,
+          rotation: _userHeading,
+        ),
+      };
+    }
+    return {};
   }
 
   Future<void> _loadLocalCarInfo() async {
@@ -95,6 +198,7 @@ class HomeScreenState extends State<HomeScreen> {
       if (!mounted) return;
       setState(() {
         _userName = profile.name ?? '—';
+        _userId = profile.id;
         _userPhotoUrl = profile.photo;
       });
 
@@ -111,11 +215,13 @@ class HomeScreenState extends State<HomeScreen> {
             _locationLabel = label;
           }
         });
+        unawaited(_syncHomeMapCameraToUser());
       }
     } catch (e) {
       if (!mounted) return;
       setState(() {
         _userName = _userName ?? '—';
+        _userId = null;
         _profileLoading = false;
       });
     } finally {
@@ -160,106 +266,66 @@ class HomeScreenState extends State<HomeScreen> {
     return '${lat.toStringAsFixed(4)}, ${lng.toStringAsFixed(4)}';
   }
 
-  Future<void> _fetchUserLocation() async {
-    setState(() {
-      _locationLoading = true;
-    });
+  void _bindDriverLocationStream() {
+    final loc = DriverMapLocationController.ensure();
+    void sync() => _syncFromDriverLocationController(loc);
 
-    try {
-      final serviceEnabled = await Geolocator.isLocationServiceEnabled();
-      if (!serviceEnabled) {
-        if (!mounted) return;
-        setState(() {
-          _locationLoading = false;
-          _locationLabel = 'location_services_off'.tr;
-        });
-        return;
-      }
+    _driverLatLngWorker = ever(loc.currentLatLng, (_) => sync());
+    _driverHeadingWorker = ever(loc.headingDeg, (_) => sync());
+    _driverPermissionWorker = ever(loc.permissionIssueKey, (_) => sync());
 
-      LocationPermission permission = await Geolocator.checkPermission();
-      if (permission == LocationPermission.denied) {
-        permission = await Geolocator.requestPermission();
-      }
+    WidgetsBinding.instance.addPostFrameCallback((_) => sync());
+  }
 
-      if (permission == LocationPermission.denied ||
-          permission == LocationPermission.deniedForever) {
-        if (!mounted) return;
-        setState(() {
-          _locationLoading = false;
-          _locationLabel = 'location_permission_needed'.tr;
-        });
-        return;
-      }
+  void _syncFromDriverLocationController(DriverMapLocationController loc) {
+    if (!mounted) return;
+    final issue = loc.permissionIssueKey.value?.trim();
 
-      final position = await Geolocator.getCurrentPosition(
-        locationSettings: const LocationSettings(
-          accuracy: LocationAccuracy.medium,
-        ),
-      );
-      final userLatLng = LatLng(position.latitude, position.longitude);
+    final latLng = loc.currentLatLng.value;
+    final hd = loc.headingDeg.value;
 
-      String label;
-      try {
-        final placemarks = await placemarkFromCoordinates(
-          position.latitude,
-          position.longitude,
-        );
-        if (placemarks.isNotEmpty) {
-          final p = placemarks.first;
-          final street = (p.street?.isNotEmpty == true)
-              ? p.street
-              : (p.name?.isNotEmpty == true ? p.name : null);
-          final city = p.locality;
-          final state = p.administrativeArea;
-          final country = p.country;
-
-          final parts = <String>[];
-          if (street != null && street.isNotEmpty) parts.add(street);
-          if (city != null && city.isNotEmpty && !parts.contains(city)) {
-            parts.add(city);
-          }
-          if (state != null && state.isNotEmpty && !parts.contains(state)) {
-            parts.add(state);
-          }
-          if (country != null &&
-              country.isNotEmpty &&
-              !parts.contains(country)) {
-            parts.add(country);
-          }
-
-          if (parts.length > 3) {
-            label = parts.sublist(0, 3).join(', ');
-          } else if (parts.isNotEmpty) {
-            label = parts.join(', ');
-          } else {
-            label =
-                '${position.latitude.toStringAsFixed(4)}, ${position.longitude.toStringAsFixed(4)}';
-          }
-        } else {
-          label =
-              '${position.latitude.toStringAsFixed(4)}, ${position.longitude.toStringAsFixed(4)}';
-        }
-      } catch (_) {
-        label =
-            '${position.latitude.toStringAsFixed(4)}, ${position.longitude.toStringAsFixed(4)}';
-      }
-
-      if (!mounted) return;
+    if (issue != null && issue.isNotEmpty) {
       setState(() {
         _locationLoading = false;
-        _locationLabel = label;
-        _userLatLng = userLatLng;
+        _locationLabel = issue.tr;
       });
-      _mapController?.animateCamera(CameraUpdate.newLatLngZoom(userLatLng, 14));
-    } catch (_) {
-      if (!mounted) return;
-      setState(() {
-        _locationLoading = false;
-        if (_locationLabel.isEmpty) {
-          _locationLabel = 'could_not_get_location'.tr;
-        }
-      });
+      return;
     }
+
+    if (latLng != null) {
+      setState(() {
+        _locationLoading = false;
+        _userLatLng = latLng;
+        _userHeading = hd;
+      });
+      unawaited(_maybeReverseGeocodeForHome(latLng));
+      unawaited(_syncHomeMapCameraToUser());
+    }
+  }
+
+  Future<void> _maybeReverseGeocodeForHome(LatLng p) async {
+    final anchor = _lastGeocodeAnchor;
+    final now = DateTime.now();
+    if (anchor != null) {
+      final d = Geolocator.distanceBetween(
+        anchor.latitude,
+        anchor.longitude,
+        p.latitude,
+        p.longitude,
+      );
+      if (d < 40 &&
+          now.difference(_lastGeocodeAt) < const Duration(seconds: 45)) {
+        return;
+      }
+    }
+    _lastGeocodeAnchor = p;
+    _lastGeocodeAt = now;
+
+    final label = await _reverseGeocodeLabel(p.latitude, p.longitude);
+    if (!mounted) return;
+    setState(() {
+      _locationLabel = label;
+    });
   }
 
   LatLng get _mapTarget => _userLatLng ?? _defaultMapCenter;
@@ -670,33 +736,6 @@ class HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Set<Marker> _nearbyRideMarkers() {
-    const rideHue = BitmapDescriptor.hueYellow;
-    final center = _mapTarget;
-    final offsets = <List<double>>[
-      [0.004, 0.002],
-      [-0.0032, 0.0048],
-      [0.0025, -0.004],
-      [-0.0045, -0.0025],
-      [0.001, 0.006],
-    ];
-    return {
-      for (var i = 0; i < offsets.length; i++)
-        Marker(
-          markerId: MarkerId('ride_$i'),
-          position: LatLng(
-            center.latitude + offsets[i][0],
-            center.longitude + offsets[i][1],
-          ),
-          icon: BitmapDescriptor.defaultMarkerWithHue(rideHue),
-          infoWindow: InfoWindow(
-            title: 'Ride nearby',
-            snippet: 'Placeholder • ~${i + 2} min',
-          ),
-        ),
-    };
-  }
-
   /// Call when the Home tab becomes active again (see [Navbar]).
   Future<void> refreshDashboard() => _loadDriverDashboard(silent: true);
 
@@ -786,6 +825,10 @@ class HomeScreenState extends State<HomeScreen> {
 
   @override
   void dispose() {
+    _homeMapThemeWorker?.dispose();
+    _driverLatLngWorker?.dispose();
+    _driverHeadingWorker?.dispose();
+    _driverPermissionWorker?.dispose();
     _mapController?.dispose();
     _searchController.dispose();
     super.dispose();
@@ -880,6 +923,7 @@ class HomeScreenState extends State<HomeScreen> {
                               fontSize: 14.sp,
                             ),
                           ),
+
                           Row(
                             children: [
                               Flexible(
@@ -903,6 +947,17 @@ class HomeScreenState extends State<HomeScreen> {
                                 size: 18.sp,
                               ),
                             ],
+                          ),
+                          SizedBox(height: 2.h),
+                          Text(
+                            _profileLoading
+                                ? '${'driver_id_label'.tr}: …'
+                                : '${'driver_id_label'.tr}: ${_userId ?? '—'}',
+                            style: TextStyle(
+                              color: Colors.white.withValues(alpha: 0.82),
+                              fontSize: 12.sp,
+                              fontWeight: FontWeight.w500,
+                            ),
                           ),
                         ],
                       ),
@@ -1173,36 +1228,95 @@ class HomeScreenState extends State<HomeScreen> {
                   SizedBox(height: 12.h),
                   const ActiveOrdersSection(previewCardLimit: 3),
                   SizedBox(height: 16.h),
+                  Padding(
+                    padding: EdgeInsets.only(bottom: 8.h),
+                    child: Align(
+                      alignment: AlignmentDirectional.centerStart,
+                      child: Text(
+                        'tap_map_live_orders_hint'.tr,
+                        style: TextStyle(
+                          color: _textWithOpacity(0.62),
+                          fontSize: 12.5.sp,
+                          fontWeight: FontWeight.w600,
+                          height: 1.3,
+                        ),
+                      ),
+                    ),
+                  ),
                   ClipRRect(
                     borderRadius: BorderRadius.circular(12.r),
                     child: SizedBox(
                       width: double.infinity,
                       height: 300.h,
-                      child: GoogleMap(
-                        initialCameraPosition: CameraPosition(
-                          target: _mapTarget,
-                          zoom: 13.8,
-                        ),
-                        markers: _nearbyRideMarkers(),
-                        myLocationEnabled: true,
-                        myLocationButtonEnabled: false,
-                        zoomControlsEnabled: false,
-                        mapToolbarEnabled: false,
-                        compassEnabled: false,
-                        onMapCreated: (c) {
-                          _mapController = c;
-                          if (_userLatLng != null) {
-                            c.animateCamera(
-                              CameraUpdate.newLatLngZoom(_userLatLng!, 14),
-                            );
-                          }
-                        },
-                        gestureRecognizers:
-                            <Factory<OneSequenceGestureRecognizer>>{
-                              Factory<EagerGestureRecognizer>(
-                                EagerGestureRecognizer.new,
-                              ),
+                      child: Stack(
+                        children: [
+                          GoogleMap(
+                            initialCameraPosition: CameraPosition(
+                              target: _mapTarget,
+                              zoom: 13.8,
+                            ),
+                            style: _homeMapStyleJson,
+                            mapType: _homeMapType,
+                            markers: _allHomeMapMarkers(),
+                            myLocationEnabled: false,
+                            myLocationButtonEnabled: false,
+                            zoomControlsEnabled: false,
+                            mapToolbarEnabled: false,
+                            compassEnabled: false,
+                            onTap: (_) {
+                              Get.to(
+                                () => FullScreenDashboardMapScreen(
+                                  seedLatLng: _userLatLng,
+                                  seedHeading: _userHeading,
+                                  seedMapType: _homeMapType,
+                                ),
+                              );
                             },
+                            onMapCreated: _onHomeMapCreated,
+                            gestureRecognizers:
+                                <Factory<OneSequenceGestureRecognizer>>{
+                                  Factory<EagerGestureRecognizer>(
+                                    EagerGestureRecognizer.new,
+                                  ),
+                                },
+                          ),
+                          Positioned(
+                            top: 8.h,
+                            right: 8.w,
+                            child: Material(
+                              color: Colors.white.withValues(alpha: 0.95),
+                              shape: const CircleBorder(),
+                              elevation: 2,
+                              child: PopupMenuButton<MapType>(
+                                tooltip: 'map_type'.tr,
+                                icon: Icon(
+                                  Icons.layers_rounded,
+                                  color: AppConst.black,
+                                  size: 22.sp,
+                                ),
+                                onSelected: _setHomeMapType,
+                                itemBuilder: (context) => [
+                                  PopupMenuItem(
+                                    value: MapType.normal,
+                                    child: Text('map_type_default'.tr),
+                                  ),
+                                  PopupMenuItem(
+                                    value: MapType.satellite,
+                                    child: Text('map_type_satellite'.tr),
+                                  ),
+                                  PopupMenuItem(
+                                    value: MapType.terrain,
+                                    child: Text('map_type_terrain'.tr),
+                                  ),
+                                  PopupMenuItem(
+                                    value: MapType.hybrid,
+                                    child: Text('map_type_hybrid'.tr),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ],
                       ),
                     ),
                   ),

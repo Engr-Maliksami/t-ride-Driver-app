@@ -36,6 +36,21 @@ class FirestoreActiveOrderMapper {
     return ActiveDriverSummary.fromJson({'driver_id': assigned});
   }
 
+  static DateTime? _acceptedAtFromData(Map<String, dynamic> data) {
+    final v = data['accepted_at'];
+    if (v == null) return null;
+    if (v is Timestamp) return v.toDate().toLocal();
+    if (v is String) return DateTime.tryParse(v)?.toLocal();
+    if (v is int) {
+      return DateTime.fromMillisecondsSinceEpoch(v, isUtc: true).toLocal();
+    }
+    if (v is num) {
+      return DateTime.fromMillisecondsSinceEpoch(v.round(), isUtc: true)
+          .toLocal();
+    }
+    return null;
+  }
+
   /// `active_rides` collection document.
   static ActiveRideCourierOrder activeRideToModel(
     String documentId,
@@ -53,6 +68,7 @@ class FirestoreActiveOrderMapper {
       rideCustomId: _string(rideIdRaw) ?? documentId,
       riderId: _parseInt(rider?['id']),
       driverId: _parseInt(data['assigned_driver_id']),
+      acceptedAt: _acceptedAtFromData(data),
       pickupAddress: _string(pickup?['address']),
       pickupLat: _latString(pickup?['latitude']),
       pickupLng: _lngString(pickup?['longitude']),
@@ -85,6 +101,7 @@ class FirestoreActiveOrderMapper {
       rideCustomId: docIdLabel,
       riderId: _parseInt(rider?['id']),
       driverId: _parseInt(data['assigned_driver_id']),
+      acceptedAt: _acceptedAtFromData(data),
       receiverName: _string(dropoff?['receiver_name']),
       receiverPhone: _string(dropoff?['receiver_phone']),
       packageSize: pkg?['size']?.toString(),
@@ -114,11 +131,39 @@ class FirestoreActiveOrderMapper {
     Map<String, dynamic> data,
   ) {
     final pickup = _asMap(data['pickup']);
-    if (pickup == null) return null;
-    final lat = _parseCoordLat(pickup['latitude']);
-    final lng = _parseCoordLng(pickup['longitude']);
-    if (lat == null || lng == null) return null;
-    return (lat: lat, lng: lng);
+    if (pickup != null) {
+      final lat =
+          _parseCoordLat(pickup['latitude']) ?? _parseCoordLat(pickup['lat']);
+      final lng =
+          _parseCoordLng(pickup['longitude']) ?? _parseCoordLng(pickup['lng']);
+      if (lat != null && lng != null) return (lat: lat, lng: lng);
+    }
+    final lat = _parseCoordLat(data['pickup_lat']) ??
+        _parseCoordLat(data['pickup_latitude']);
+    final lng = _parseCoordLng(data['pickup_lng']) ??
+        _parseCoordLng(data['pickup_longitude']);
+    if (lat != null && lng != null) return (lat: lat, lng: lng);
+    return null;
+  }
+
+  /// Dropoff [latitude] / [longitude] in degrees (from nested `dropoff`), or null.
+  static ({double lat, double lng})? dropoffCoordinates(
+    Map<String, dynamic> data,
+  ) {
+    final dropoff = _asMap(data['dropoff']);
+    if (dropoff != null) {
+      final lat =
+          _parseCoordLat(dropoff['latitude']) ?? _parseCoordLat(dropoff['lat']);
+      final lng = _parseCoordLng(dropoff['longitude']) ??
+          _parseCoordLng(dropoff['lng']);
+      if (lat != null && lng != null) return (lat: lat, lng: lng);
+    }
+    final lat = _parseCoordLat(data['dropoff_lat']) ??
+        _parseCoordLat(data['dropoff_latitude']);
+    final lng = _parseCoordLng(data['dropoff_lng']) ??
+        _parseCoordLng(data['dropoff_longitude']);
+    if (lat != null && lng != null) return (lat: lat, lng: lng);
+    return null;
   }
 
   static double? _parseCoordLat(dynamic v) {
